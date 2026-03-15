@@ -12,6 +12,7 @@ dist/
 
 # OAuth tokens (NEVER commit these!)
 .oauth-tokens.json
+.chatgpt-api-key.json
 tokens.json
 *.tokens.json
 
@@ -34,6 +35,7 @@ yarn-error.log*
 *.mitm
 *.har
 *.pcap
+codex-proxy-log.json
 
 # Temporary files
 tmp/
@@ -42,6 +44,7 @@ tmp/
 *.bak
 *.backup
 *~
+*.tgz
 
 # Editor directories and files
 .vscode/

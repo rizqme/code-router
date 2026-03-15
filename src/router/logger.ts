@@ -46,6 +46,36 @@ export class Logger {
     }
   }
 
+  logUpstreamRequest(
+    provider: 'anthropic' | 'openai',
+    method: string,
+    url: string,
+    headers: Record<string, string>,
+    body?: unknown
+  ) {
+    if (this.level !== 'maximum') {
+      return;
+    }
+
+    const endpoint = provider === 'openai' ? 'OpenAI' : 'Anthropic';
+    const maskedHeaders = { ...headers };
+    if (maskedHeaders.Authorization && maskedHeaders.Authorization.startsWith('Bearer ')) {
+      maskedHeaders.Authorization =
+        `Bearer ${maskedHeaders.Authorization.slice(7, 12)}...${maskedHeaders.Authorization.slice(-4)}`;
+    }
+
+    console.log(`\n[${endpoint} FORWARD] ${method} ${url}`);
+    console.log('Headers:');
+    console.log(JSON.stringify(maskedHeaders, null, 2));
+
+    if (body !== undefined) {
+      console.log('Body:');
+      console.log(JSON.stringify(body, null, 2));
+    }
+
+    console.log('='.repeat(80));
+  }
+
   private logMinimal(
     requestId: string,
     timestamp: string,

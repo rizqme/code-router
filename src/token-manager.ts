@@ -14,10 +14,12 @@
  */
 
 import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import type { OAuthTokens } from './types.js';
 import { refreshAccessToken } from './oauth.js';
 
-const TOKEN_FILE = '.oauth-tokens.json';
+export const TOKEN_FILE = path.join(os.homedir(), '.oauth-tokens.json');
 
 /**
  * Save tokens to file

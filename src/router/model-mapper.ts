@@ -102,6 +102,35 @@ export function mapOpenAIModelToAnthropic(modelName: string): string {
 }
 
 /**
+ * Map Anthropic model name to OpenAI model name for /v1/messages reverse routing
+ */
+export function mapAnthropicModelToOpenAI(modelName: string): string {
+  if (process.env.OPENAI_DEFAULT_MODEL) {
+    return process.env.OPENAI_DEFAULT_MODEL;
+  }
+
+  const normalized = modelName.toLowerCase();
+
+  if (normalized.startsWith('gpt-') || normalized.startsWith('o1') || normalized.startsWith('o3')) {
+    return modelName;
+  }
+
+  if (normalized.includes('opus')) {
+    return 'gpt-4o';
+  }
+
+  if (normalized.includes('haiku')) {
+    return 'gpt-4o-mini';
+  }
+
+  if (normalized.includes('sonnet')) {
+    return 'gpt-4o';
+  }
+
+  return 'gpt-4o';
+}
+
+/**
  * Get a description of which pattern matched for a given model
  * Used for logging/debugging
  */

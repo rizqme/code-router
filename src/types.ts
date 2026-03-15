@@ -103,6 +103,16 @@ export interface AnthropicResponse {
   };
 }
 
+export type Provider = 'anthropic' | 'openai';
+
+export interface OpenAIResponsesRequest {
+  [key: string]: unknown;
+}
+
+export interface OpenAIResponsesResponse {
+  [key: string]: unknown;
+}
+
 /**
  * OAuth configuration
  */

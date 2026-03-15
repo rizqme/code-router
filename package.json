@@ -1,16 +1,16 @@
 {
-  "name": "anthropic-max-router",
+  "name": "code-router",
   "version": "1.4.2",
-  "description": "Dual API router (Anthropic + OpenAI compatible) for Claude MAX Plan - Use flat-rate billing with ANY AI tool: OpenAI SDK, LangChain, Anthropic SDK, and more",
-  "main": "dist/index.js",
+  "description": "Dual provider router for Claude MAX and ChatGPT subscriptions.",
+  "main": "dist/router/server.js",
   "type": "module",
   "bin": {
-    "anthropic-max-router": "dist/router/server.js",
-    "max-router": "dist/router/server.js"
+    "code-router": "dist/bin/code-router.js"
   },
   "scripts": {
-    "start": "tsx src/cli.ts",
+    "start": "tsx src/bin/code-router.ts",
     "router": "tsx src/router/server.ts",
+    "dev": "tsx src/router/server.ts",
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "lint": "eslint 'src/**/*.ts'",
@@ -61,8 +61,11 @@
   "author": "nsxdavid (David Whatley) <https://davidwhatley.com>",
   "license": "MIT",
   "dependencies": {
+    "@types/react": "^19.2.14",
     "dotenv": "^16.4.5",
-    "express": "^4.15.5"
+    "express": "^4.15.5",
+    "ink": "^6.8.0",
+    "react": "^19.2.4"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
