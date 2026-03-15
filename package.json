@@ -22,9 +22,7 @@
     "dist",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md",
-    "ANTHROPIC-MAX-PLAN-IMPLEMENTATION-GUIDE.md",
-    "assets"
+    "CHANGELOG.md"
   ],
   "keywords": [
     "anthropic",
