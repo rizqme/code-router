@@ -1,6 +1,6 @@
 {
   "name": "code-router",
-  "version": "1.4.2",
+  "version": "0.1.3",
   "description": "Dual provider router for Claude MAX and ChatGPT subscriptions.",
   "main": "dist/router/server.js",
   "type": "module",
@@ -58,7 +58,7 @@
     "haiku",
     "multi-endpoint"
   ],
-  "author": "nsxdavid (David Whatley) <https://davidwhatley.com>",
+  "author": "rizqme",
   "license": "MIT",
   "dependencies": {
     "@types/react": "^19.2.14",

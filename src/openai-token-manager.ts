@@ -221,6 +221,18 @@ function normalizeRefreshResult(
   };
 }
 
+function getPreferredOpenAIAuthToken(state: OpenAIAuthState): string | null {
+  if (state.apiKey && state.apiKey.trim()) {
+    return state.apiKey.trim();
+  }
+
+  if (state.accessToken && state.accessToken.trim()) {
+    return state.accessToken.trim();
+  }
+
+  return null;
+}
+
 function parseExpiringValue(
   expiresIn: number | undefined,
   accessToken: string | undefined,
@@ -239,24 +251,29 @@ function parseExpiringValue(
 
 export async function getValidOpenAIAccessToken(): Promise<string> {
   const state = await loadOpenAIAuthState();
-  if (!state || !state.apiKey) {
+  if (!state) {
     throw new Error('No ChatGPT auth state found. Run ChatGPT OAuth (option 2) first.');
   }
 
   if (state.source === 'manual') {
+    if (!state.apiKey) {
+      throw new Error('No ChatGPT token found. Run ChatGPT OAuth or save a token first.');
+    }
     return state.apiKey;
   }
 
   if (!state.refreshToken) {
-    if (!state.apiKey) {
+    const availableToken = getPreferredOpenAIAuthToken(state);
+    if (!availableToken) {
       throw new Error('No OAuth API key and no refresh token are available. Re-authenticate.');
     }
 
-    return state.apiKey;
+    return availableToken;
   }
 
-  if (!isOpenAIAccessTokenExpired(state) && state.apiKey) {
-    return state.apiKey;
+  const availableToken = getPreferredOpenAIAuthToken(state);
+  if (!isOpenAIAccessTokenExpired(state) && availableToken) {
+    return availableToken;
   }
 
   if (!state.refreshToken) {
@@ -264,20 +281,14 @@ export async function getValidOpenAIAccessToken(): Promise<string> {
   }
 
   const refreshed = await refreshOpenAIAccessToken(state.refreshToken);
-  if (!refreshed.id_token) {
-    throw new Error(
-      'ChatGPT token refresh did not return id_token. Re-authenticate to regenerate tokens.'
-    );
-  }
-
-  const refreshedApiKey = await exchangeIdTokenForOpenAIApiKey(refreshed.id_token);
-  if (!refreshedApiKey) {
-    throw new Error('Failed to exchange refreshed ChatGPT token for OpenAI API key.');
-  }
+  const refreshedApiKey =
+    refreshed.id_token
+      ? await exchangeIdTokenForOpenAIApiKey(refreshed.id_token).catch(() => refreshed.access_token)
+      : refreshed.access_token;
 
   const normalizedState = normalizeRefreshResult(state, refreshed, refreshedApiKey);
   await saveOpenAIAuthState(normalizedState);
-  return normalizedState.apiKey;
+  return normalizedState.apiKey || normalizedState.accessToken || refreshed.access_token;
 }
 
 export async function loadOpenAIKey(): Promise<string | null> {

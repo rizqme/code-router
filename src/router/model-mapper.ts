@@ -65,6 +65,13 @@ function isHighTierOSeries(model: string): boolean {
  * @returns Anthropic model name (e.g., 'claude-sonnet-4-5')
  */
 export function mapOpenAIModelToAnthropic(modelName: string): string {
+  const normalizedInput = modelName.toLowerCase();
+
+  // Preserve explicit Anthropic model IDs passed through OpenAI-compatible APIs.
+  if (normalizedInput.startsWith('claude-')) {
+    return modelName;
+  }
+
   // 1. Check custom mappings first
   const customMappings = loadCustomMappings();
   if (customMappings[modelName]) {
@@ -77,7 +84,7 @@ export function mapOpenAIModelToAnthropic(modelName: string): string {
   }
 
   // 3. Pattern-based tier detection
-  const model = modelName.toLowerCase();
+  const model = normalizedInput;
 
   // High-tier patterns → Opus (premium/reasoning models)
   const highTierSuffixes = ['-pro', '-max', '-ultra'];

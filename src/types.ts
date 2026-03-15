@@ -58,7 +58,7 @@ export interface Message {
  * Content block for messages
  */
 export interface ContentBlock {
-  type: 'text' | 'tool_use' | 'tool_result';
+  type: 'text' | 'image' | 'tool_use' | 'tool_result';
   text?: string;
   [key: string]: unknown;
 }
@@ -129,11 +129,26 @@ export interface OAuthConfig {
  */
 export interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  content: string | OpenAIContentPart[] | null;
   name?: string;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
 }
+
+export interface OpenAITextContentPart {
+  type: 'text';
+  text: string;
+}
+
+export interface OpenAIImageContentPart {
+  type: 'image_url';
+  image_url: {
+    url: string;
+    detail?: string;
+  };
+}
+
+export type OpenAIContentPart = OpenAITextContentPart | OpenAIImageContentPart;
 
 /**
  * OpenAI Tool Call

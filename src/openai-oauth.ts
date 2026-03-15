@@ -45,6 +45,7 @@ export interface OpenAIOAuthResult {
   oauthAccessToken: string;
   accessTokenExpiresAt?: number;
   accountId: string;
+  apiKeyExchangeSucceeded: boolean;
 }
 
 interface CallbackContext {
@@ -420,13 +421,6 @@ export async function runOpenAIOAuthFlow(
       throw new Error('Authorization code exchange did not return id_token');
     }
 
-    const organizationId = getIdTokenOrganizationId(idToken);
-    if (!organizationId) {
-      throw new Error(
-        'Authorization code exchange id_token is missing required organization_id claim; cannot perform API-key exchange'
-      );
-    }
-    console.log(`Using organization_id: ${organizationId}`);
     const accountId = getIdTokenAccountId(idToken);
     if (!accountId) {
       throw new Error(
@@ -434,7 +428,22 @@ export async function runOpenAIOAuthFlow(
       );
     }
 
-    const openAIApiKey = await exchangeIdTokenForOpenAIApiKey(idToken);
+    const organizationId = getIdTokenOrganizationId(idToken);
+    let openAIAccessToken = exchanged.access_token;
+    let apiKeyExchangeSucceeded = false;
+    if (organizationId) {
+      console.log(`Using organization_id: ${organizationId}`);
+      try {
+        openAIAccessToken = await exchangeIdTokenForOpenAIApiKey(idToken);
+        apiKeyExchangeSucceeded = true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.log(`API-key exchange unavailable; using backend OAuth token instead (${message})`);
+      }
+    } else {
+      console.log('organization_id claim missing; using backend OAuth token instead');
+    }
+
     const refreshToken = exchanged.refresh_token;
     if (!refreshToken) {
       throw new Error('Authorization code exchange did not return refresh_token');
@@ -444,11 +453,12 @@ export async function runOpenAIOAuthFlow(
       : undefined;
     return {
       idToken,
-      accessToken: openAIApiKey,
+      accessToken: openAIAccessToken,
       oauthAccessToken: exchanged.access_token,
       refreshToken,
       accountId,
       accessTokenExpiresAt: idTokenExpiry,
+      apiKeyExchangeSucceeded,
     };
   } finally {
     close();

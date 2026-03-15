@@ -109,22 +109,10 @@ export class Logger {
     console.log(`  Model: ${request.model}`);
     console.log(`  Max tokens: ${request.max_tokens}`);
 
-    if (endpointType === 'openai') {
-      console.log(`  ✓ Translated OpenAI → Anthropic format`);
-    }
-
-    if (!hadSystemPrompt) {
-      console.log(`  ✓ Injected required system prompt`);
-    } else {
-      console.log(`  ✓ System prompt already present`);
-    }
-
-    console.log(`  ✓ OAuth token validated`);
-
     if (error) {
       console.log(`  ✗ Error: ${error.message}`);
     } else if (response) {
-      console.log(`  → Forwarding to Anthropic API...`);
+      console.log(`  → Forwarding upstream...`);
       if (response.status >= 200 && response.status < 300) {
         console.log(`  ✓ Success (${response.status})`);
         if (response.data?.usage) {
@@ -155,7 +143,16 @@ export class Logger {
     console.log(JSON.stringify(request, null, 2));
 
     if (endpointType === 'openai') {
-      console.log('\n✓ Translated OpenAI → Anthropic format');
+      console.log('\n✓ OpenAI-compatible request normalized');
+      const contentSummary = summarizeAnthropicMessages(request);
+      if (contentSummary) {
+        console.log(`Content Summary: ${contentSummary}`);
+      }
+
+      const imageCount = countImageBlocks(request);
+      if (imageCount > 0) {
+        console.log(`Image Blocks: ${imageCount}`);
+      }
     }
 
     if (!hadSystemPrompt) {
@@ -165,7 +162,7 @@ export class Logger {
     }
 
     console.log('✓ OAuth token validated');
-    console.log('→ Forwarding to Anthropic API...\n');
+    console.log('→ Forwarding upstream...\n');
 
     if (error) {
       console.log('='.repeat(80));
@@ -182,7 +179,7 @@ export class Logger {
   }
 
   info(message: string) {
-    if (this.level !== 'quiet') {
+    if (this.level === 'maximum') {
       console.log(message);
     }
   }
@@ -191,6 +188,70 @@ export class Logger {
     // Always show errors
     console.error(message, error || '');
   }
+}
+
+function summarizeAnthropicMessages(request: AnthropicRequest): string {
+  return request.messages
+    .slice(0, 6)
+    .map((message, messageIndex) => {
+      if (typeof message.content === 'string') {
+        const preview = message.content.replace(/\s+/g, ' ').trim().slice(0, 60);
+        return `${messageIndex + 1}:${message.role}[text${preview ? `="${preview}"` : ''}]`;
+      }
+
+      const blockTypes = message.content
+        .map((block) => {
+          const blockType = typeof block?.type === 'string' ? block.type : 'unknown';
+          if (blockType === 'image') {
+            const source =
+              block && typeof block === 'object' && block.source && typeof block.source === 'object'
+                ? (block.source as Record<string, unknown>)
+                : null;
+            const sourceType = typeof source?.type === 'string' ? source.type : 'unknown';
+            return `image:${sourceType}`;
+          }
+          return blockType;
+        })
+        .join(',');
+      return `${messageIndex + 1}:${message.role}[${blockTypes || 'empty'}]`;
+    })
+    .join(' | ');
+}
+
+function countImageBlocks(request: AnthropicRequest): number {
+  return request.messages.reduce((count, message) => {
+    if (!Array.isArray(message.content)) {
+      return count;
+    }
+
+    return (
+      count +
+      message.content.filter(
+        (block) => !!block && typeof block === 'object' && block.type === 'image'
+      ).length
+    );
+  }, 0);
+}
+
+function findUnexpectedContentBlock(
+  request: AnthropicRequest
+): { messageIndex: number; blockIndex: number; block: Record<string, unknown> } | null {
+  for (let messageIndex = 0; messageIndex < request.messages.length; messageIndex += 1) {
+    const message = request.messages[messageIndex];
+    if (!Array.isArray(message?.content)) {
+      continue;
+    }
+
+    for (let blockIndex = 0; blockIndex < message.content.length; blockIndex += 1) {
+      const block = message.content[blockIndex] as Record<string, unknown>;
+      const blockType = typeof block?.type === 'string' ? block.type : 'unknown';
+      if (blockType !== 'text' && blockType !== 'tool_use' && blockType !== 'tool_result') {
+        return { messageIndex, blockIndex, block };
+      }
+    }
+  }
+
+  return null;
 }
 
 export const logger = new Logger();

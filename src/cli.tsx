@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 
 import { execSync, spawn } from 'child_process';
+import { readFileSync } from 'fs';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, render, useApp, useInput } from 'ink';
 import { startOAuthFlow, exchangeCodeForTokens } from './oauth.js';
@@ -21,6 +22,11 @@ import {
   getValidOpenAIAccessToken,
 } from './openai-token-manager.js';
 import type { OAuthTokens } from './types.js';
+
+const PACKAGE_VERSION = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8')
+) as { version?: string };
+const VERSION = PACKAGE_VERSION.version || '0.0.0';
 
 type AuthSnapshot = {
   routerRunning: boolean;
@@ -121,7 +127,7 @@ function getApiViewLines(provider: 'openai' | 'claude' | 'openrouter'): string[]
   if (provider === 'claude') {
     return [
       'Claude API',
-      '  Base URL: http://localhost:3000',
+      '  Base URL: http://localhost:3344',
       '  POST /v1/messages',
       '  GET  /v1/models',
     ];
@@ -130,7 +136,7 @@ function getApiViewLines(provider: 'openai' | 'claude' | 'openrouter'): string[]
   if (provider === 'openrouter') {
     return [
       'OpenRouter API',
-      '  Base URL: http://localhost:3000/v1',
+      '  Base URL: http://localhost:3344/v1',
       '  POST /chat/completions',
       '  POST /responses',
       '  GET  /models?provider=openrouter',
@@ -143,7 +149,7 @@ function getApiViewLines(provider: 'openai' | 'claude' | 'openrouter'): string[]
 
   return [
     'OpenAI API',
-    '  Base URL: http://localhost:3000/v1',
+    '  Base URL: http://localhost:3344/v1',
     '  POST /chat/completions',
     '  POST /responses',
     '  GET  /models',
@@ -403,7 +409,7 @@ async function deleteIfExists(path: string): Promise<void> {
   }
 }
 
-async function isRouterRunning(port = 3000): Promise<boolean> {
+async function isRouterRunning(port = 3344): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1000);
 
@@ -419,7 +425,7 @@ async function isRouterRunning(port = 3000): Promise<boolean> {
   }
 }
 
-function startRouterDetached(port = 3000): number | undefined {
+function startRouterDetached(port = 3344): number | undefined {
   const npmCommand = process.platform === 'win32' ? 'npm.cmd' : 'npm';
   const child = spawn(npmCommand, ['run', 'router', '--', '--port', String(port)], {
     cwd: process.cwd(),
@@ -439,7 +445,7 @@ function stopRouterProcess(pid: number): void {
   process.kill(-pid, 'SIGTERM');
 }
 
-function findRouterPids(port = 3000): number[] {
+function findRouterPids(port = 3344): number[] {
   if (process.platform === 'win32') {
     return [];
   }
@@ -524,7 +530,7 @@ function App() {
   const routerPidRef = useRef<number | null>(null);
 
   const showView = useCallback(
-    (title: string, lines: string[], backScreen: 'root' | 'serve' | 'apis' = 'root') => {
+    (title: string, lines: string[], backScreen: 'root' | 'serve' = 'root') => {
       setViewTitle(title);
       setViewLines(lines);
       setViewOffset(0);
@@ -630,7 +636,7 @@ function App() {
           return;
         case 'start-serve':
           await runTask(async () => {
-            const port = 3000;
+            const port = 3344;
             if (await isRouterRunning(port)) {
               await refreshAuth();
               showView('SERVE', [`Router is already running on http://localhost:${port}`], 'serve');
@@ -675,7 +681,7 @@ function App() {
           return;
         case 'stop-serve':
           await runTask(async () => {
-            const port = 3000;
+            const port = 3344;
             const stoppedTrackedRouter = stopTrackedRouter();
             const discoveredPids = stoppedTrackedRouter ? [] : findRouterPids(port);
 
@@ -908,7 +914,19 @@ function App() {
     [ask, exit, refreshAuth, runTask, screen, showView, stopTrackedRouter, viewBackScreen]
   );
 
-  useInput((input, key) => {
+  useInput((
+    input: string,
+    key: {
+      escape: boolean;
+      return: boolean;
+      backspace: boolean;
+      delete: boolean;
+      ctrl: boolean;
+      meta: boolean;
+      upArrow: boolean;
+      downArrow: boolean;
+    }
+  ) => {
     if (promptRequest) {
       if (key.escape) {
         cancel();
@@ -1017,6 +1035,7 @@ function App() {
         </Box>
 
         <Box borderLeft borderColor="blue" paddingLeft={2} paddingTop={1} flexDirection="column" width="50%">
+          <Text color="gray">{`v${VERSION}`}</Text>
           <Text bold>STATUS</Text>
           <Text>
             Claude:{' '}

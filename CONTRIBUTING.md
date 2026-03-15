@@ -31,8 +31,8 @@ Thank you for your interest in contributing! This project welcomes contributions
 ## Development Setup
 
 \`\`\`bash
-git clone https://github.com/nsxdavid/anthropic-max-router
-cd anthropic-max-router
+git clone https://github.com/rizqme/code-router.git
+cd code-router
 npm install
 npm run build
 \`\`\`

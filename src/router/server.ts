@@ -18,6 +18,7 @@ import {
   OpenAIMessage,
   OpenAIResponsesRequest,
   OpenAIResponsesResponse,
+  OpenAIToolCall,
   Provider,
 } from '../types.js';
 import { logger } from './logger.js';
@@ -81,6 +82,7 @@ let openAIAuth = {
   authorization: null as string | null,
   accountId: undefined as string | undefined,
 };
+let anthropicAuthConfigured = false;
 
 type OpenAIAuthContext = {
   authorization: string;
@@ -255,12 +257,21 @@ function resolveProviderHint(req: Request, request?: OpenAIProviderHint): Provid
 function resolveChatProvider(req: Request, request?: OpenAIProviderHint): Provider {
   const hinted = resolveProviderHint(req, request);
   const availability = getCachedSubscriptionAvailability();
+  const requestedModelProvider = classifyModelProvider(request?.model);
 
   if (availability.openai && !availability.anthropic) {
     return 'openai';
   }
 
   if (availability.anthropic && !availability.openai) {
+    return 'anthropic';
+  }
+
+  if (requestedModelProvider === 'openai' && availability.openai) {
+    return 'openai';
+  }
+
+  if (requestedModelProvider === 'anthropic' && availability.anthropic) {
     return 'anthropic';
   }
 
@@ -324,29 +335,62 @@ function normalizeResponsesInput(
         typeof contentValue === 'string'
           ? contentValue
           : Array.isArray(contentValue)
-            ? contentValue
-                .map((block) => {
-                  if (typeof block === 'string') {
-                    return block;
-                  }
-                  if (!block || typeof block !== 'object') {
-                    return '';
-                  }
-                  const blockObject = block as Record<string, unknown>;
-                  if (typeof blockObject.text === 'string') {
-                    return blockObject.text;
-                  }
-                  if (typeof blockObject.content === 'string') {
-                    return blockObject.content;
-                  }
-                  return '';
-                })
-                .filter(Boolean)
-                .join('\n\n')
+            ? contentValue.flatMap((block): Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string; detail?: string } }> => {
+                if (typeof block === 'string') {
+                  return block.trim().length > 0 ? [{ type: 'text', text: block }] : [];
+                }
+                if (!block || typeof block !== 'object') {
+                  return [];
+                }
+                const blockObject = block as Record<string, unknown>;
+                const nestedImageUrl =
+                  blockObject.image_url && typeof blockObject.image_url === 'object'
+                    ? (blockObject.image_url as Record<string, unknown>)
+                    : null;
+                if (
+                  (blockObject.type === 'input_image' || blockObject.type === 'image_url') &&
+                  ((typeof blockObject.image_url === 'string' &&
+                    blockObject.image_url.trim().length > 0) ||
+                    (typeof nestedImageUrl?.url === 'string' &&
+                      nestedImageUrl.url.trim().length > 0))
+                ) {
+                  const imageUrl =
+                    typeof blockObject.image_url === 'string'
+                      ? blockObject.image_url.trim()
+                      : String(nestedImageUrl?.url).trim();
+                  return [
+                    {
+                      type: 'image_url',
+                      image_url: {
+                        url: imageUrl,
+                        ...(typeof blockObject.detail === 'string'
+                          ? { detail: blockObject.detail }
+                          : typeof nestedImageUrl?.detail === 'string'
+                            ? { detail: nestedImageUrl.detail }
+                          : {}),
+                      },
+                    },
+                  ];
+                }
+                if (typeof blockObject.text === 'string' && blockObject.text.trim().length > 0) {
+                  return [{ type: 'text', text: blockObject.text }];
+                }
+                if (
+                  typeof blockObject.content === 'string' &&
+                  blockObject.content.trim().length > 0
+                ) {
+                  return [{ type: 'text', text: blockObject.content }];
+                }
+                return [];
+              })
             : '';
 
-      const trimmedContent = String(normalizedContent).trim();
-      return trimmedContent.length > 0 ? [{ role, content: trimmedContent }] : [];
+      if (typeof normalizedContent === 'string') {
+        const trimmedContent = normalizedContent.trim();
+        return trimmedContent.length > 0 ? [{ role, content: trimmedContent }] : [];
+      }
+
+      return normalizedContent.length > 0 ? [{ role, content: normalizedContent }] : [];
     });
 }
 
@@ -444,20 +488,6 @@ async function resolveStoredOpenAIAuthorization(): Promise<string | null> {
 }
 
 async function getOpenAIAuthorization(req: Request): Promise<OpenAIAuthContext | null> {
-  const bearerToken = extractBearerToken(req);
-  if (isOpenAIKey(bearerToken)) {
-    const token = bearerToken as string;
-    return {
-      authorization: `Bearer ${token}`,
-      accountId: extractAccountIdFromJwt(token),
-    };
-  }
-
-  const apiKey = extractApiKey(req);
-  if (isOpenAIKey(apiKey)) {
-    return { authorization: `Bearer ${apiKey}` };
-  }
-
   const envApiKey = process.env.CODE_ROUTER_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
   if (isOpenAIKey(envApiKey)) {
     return { authorization: `Bearer ${envApiKey}` };
@@ -511,14 +541,28 @@ type CodexResponsesUsage = {
 };
 
 function flattenOpenAIMessageContent(message: OpenAIMessage): string {
+  const flattenTextContent = (content: OpenAIMessage['content']): string => {
+    if (typeof content === 'string') {
+      return content;
+    }
+
+    if (!Array.isArray(content)) {
+      return '';
+    }
+
+    return content
+      .map((part) => (part.type === 'text' ? part.text : ''))
+      .filter((part) => part.trim().length > 0)
+      .join('\n\n');
+  };
+
   if (message.role === 'tool') {
     const prefix = `[tool_result:${message.tool_call_id || 'unknown'}]`;
-    const content =
-      typeof message.content === 'string' && message.content.trim().length > 0 ? message.content : '';
+    const content = flattenTextContent(message.content).trim();
     return [prefix, content].filter((value) => value.length > 0).join('\n\n');
   }
 
-  const content = typeof message.content === 'string' ? message.content : '';
+  const content = flattenTextContent(message.content);
   if (!message.tool_calls || message.tool_calls.length === 0) {
     return content;
   }
@@ -527,6 +571,58 @@ function flattenOpenAIMessageContent(message: OpenAIMessage): string {
     .map((toolCall) => `[tool_call:${toolCall.function.name}] ${toolCall.function.arguments}`)
     .join('\n\n');
   return [content, toolCalls].filter((value) => value.length > 0).join('\n\n');
+}
+
+function convertOpenAIMessageToResponsesContent(
+  message: OpenAIMessage
+): Array<Record<string, unknown>> {
+  const blocks: Array<Record<string, unknown>> = [];
+  const textType = message.role === 'assistant' ? 'output_text' : 'input_text';
+
+  if (typeof message.content === 'string') {
+    const trimmedContent = message.content.trim();
+    if (trimmedContent.length > 0) {
+      blocks.push({ type: textType, text: trimmedContent });
+    }
+  } else if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (part.type === 'text') {
+        const trimmedText = part.text.trim();
+        if (trimmedText.length > 0) {
+          blocks.push({ type: textType, text: trimmedText });
+        }
+        continue;
+      }
+
+      if (
+        message.role !== 'assistant' &&
+        part.type === 'image_url' &&
+        typeof part.image_url?.url === 'string' &&
+        part.image_url.url.trim().length > 0
+      ) {
+        blocks.push({
+          type: 'input_image',
+          image_url: part.image_url.url.trim(),
+          ...(part.image_url.detail ? { detail: part.image_url.detail } : {}),
+        });
+      }
+    }
+  }
+
+  if (message.tool_calls && message.tool_calls.length > 0) {
+    const toolCalls = message.tool_calls
+      .map((toolCall) => `[tool_call:${toolCall.function.name}] ${toolCall.function.arguments}`)
+      .join('\n\n')
+      .trim();
+    if (toolCalls.length > 0) {
+      blocks.push({
+        type: 'output_text',
+        text: toolCalls,
+      });
+    }
+  }
+
+  return blocks;
 }
 
 function convertChatCompletionsToResponsesRequest(
@@ -543,14 +639,9 @@ function convertChatCompletionsToResponsesRequest(
     .map((message) => ({
       type: 'message',
       role: message.role === 'tool' ? 'user' : message.role,
-      content: [
-        {
-          type: 'input_text',
-          text: flattenOpenAIMessageContent(message),
-        },
-      ],
+      content: convertOpenAIMessageToResponsesContent(message),
     }))
-    .filter((message) => message.content[0].text.trim().length > 0);
+    .filter((message) => message.content.length > 0);
 
   const responsesRequest: OpenAIResponsesRequest = {
     model: request.model,
@@ -645,13 +736,101 @@ function buildOpenAICompletionUsage(usage?: CodexResponsesUsage): OpenAIChatComp
   };
 }
 
+function extractTextFromCodexOutputItem(item: Record<string, unknown>): string {
+  if (item.type !== 'message' || !Array.isArray(item.content)) {
+    return '';
+  }
+
+  return item.content
+    .map((part) => {
+      if (!part || typeof part !== 'object') {
+        return '';
+      }
+
+      const contentPart = part as Record<string, unknown>;
+      return contentPart.type === 'output_text' && typeof contentPart.text === 'string'
+        ? contentPart.text
+        : '';
+    })
+    .filter((part) => part.length > 0)
+    .join('');
+}
+
+function translateCodexOutputItemToToolCall(
+  item: Record<string, unknown>
+): OpenAIToolCall | null {
+  const itemType = typeof item.type === 'string' ? item.type : null;
+  const callId = typeof item.call_id === 'string' ? item.call_id : null;
+
+  if (itemType === 'function_call' && callId && typeof item.name === 'string') {
+    return {
+      id: callId,
+      type: 'function',
+      function: {
+        name: item.name,
+        arguments: typeof item.arguments === 'string' ? item.arguments : '{}',
+      },
+    };
+  }
+
+  if (itemType === 'custom_tool_call' && callId && typeof item.name === 'string') {
+    return {
+      id: callId,
+      type: 'function',
+      function: {
+        name: item.name,
+        arguments: JSON.stringify({
+          input: typeof item.input === 'string' ? item.input : '',
+        }),
+      },
+    };
+  }
+
+  if (itemType === 'tool_search_call' && callId) {
+    return {
+      id: callId,
+      type: 'function',
+      function: {
+        name: 'tool_search_call',
+        arguments: JSON.stringify(item.arguments ?? {}),
+      },
+    };
+  }
+
+  if (itemType === 'local_shell_call' && callId) {
+    const action =
+      item.action && typeof item.action === 'object'
+        ? (item.action as Record<string, unknown>)
+        : null;
+    const command = Array.isArray(action?.command)
+      ? action.command.filter((entry): entry is string => typeof entry === 'string')
+      : [];
+
+    return {
+      id: callId,
+      type: 'function',
+      function: {
+        name: 'exec_command',
+        arguments: JSON.stringify({
+          cmd: command.join(' '),
+        }),
+      },
+    };
+  }
+
+  return null;
+}
+
 async function readCodexResponsesAsChatCompletion(
   stream: AsyncIterable<Uint8Array>,
   model: string
 ): Promise<OpenAIChatCompletionResponse> {
   let responseId = `chatcmpl-${Math.random().toString(36).slice(2)}`;
   let content = '';
+  let sawOutputTextDelta = false;
   let usage: CodexResponsesUsage | undefined;
+  const toolCalls: OpenAIToolCall[] = [];
+  const seenToolCallIds = new Set<string>();
 
   for await (const sseEvent of parseSSEStream(stream)) {
     if (!sseEvent.data) {
@@ -674,8 +853,28 @@ async function readCodexResponsesAsChatCompletion(
     }
 
     if (parsed.type === 'response.output_text.delta' && typeof parsed.delta === 'string') {
+      sawOutputTextDelta = true;
       content += parsed.delta;
       continue;
+    }
+
+    if (parsed.type === 'response.output_item.done' && parsed.item && typeof parsed.item === 'object') {
+      const item = parsed.item as Record<string, unknown>;
+      const toolCall = translateCodexOutputItemToToolCall(item);
+
+      if (toolCall && !seenToolCallIds.has(toolCall.id)) {
+        seenToolCallIds.add(toolCall.id);
+        toolCalls.push(toolCall);
+        logger.info(`  Codex output item: type=${item.type} name=${toolCall.function.name}`);
+        continue;
+      }
+
+      if (!sawOutputTextDelta) {
+        const outputText = extractTextFromCodexOutputItem(item);
+        if (outputText.length > 0) {
+          content += outputText;
+        }
+      }
     }
 
     if (parsed.type === 'response.completed') {
@@ -700,8 +899,9 @@ async function readCodexResponsesAsChatCompletion(
         message: {
           role: 'assistant',
           content: content || null,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
-        finish_reason: 'stop',
+        finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
       },
     ],
     usage: buildOpenAICompletionUsage(usage),
@@ -714,7 +914,11 @@ async function* translateCodexResponsesStreamToChatCompletions(
   messageId: string
 ): AsyncGenerator<string, void, unknown> {
   let emittedRole = false;
+  let sawOutputTextDelta = false;
+  let sawToolCall = false;
   let usage: CodexResponsesUsage | undefined;
+  const emittedToolCallIds = new Set<string>();
+  let nextToolCallIndex = 0;
 
   for await (const sseEvent of parseSSEStream(stream)) {
     if (!sseEvent.data) {
@@ -729,6 +933,7 @@ async function* translateCodexResponsesStreamToChatCompletions(
     }
 
     if (parsed.type === 'response.output_text.delta' && typeof parsed.delta === 'string') {
+      sawOutputTextDelta = true;
       if (!emittedRole) {
         emittedRole = true;
         yield `data: ${JSON.stringify({
@@ -747,6 +952,80 @@ async function* translateCodexResponsesStreamToChatCompletions(
         model,
         choices: [{ index: 0, delta: { content: parsed.delta }, finish_reason: null }],
       })}\n\n`;
+      continue;
+    }
+
+    if (parsed.type === 'response.output_item.done' && parsed.item && typeof parsed.item === 'object') {
+      const item = parsed.item as Record<string, unknown>;
+      const toolCall = translateCodexOutputItemToToolCall(item);
+
+      if (toolCall && !emittedToolCallIds.has(toolCall.id)) {
+        emittedToolCallIds.add(toolCall.id);
+        sawToolCall = true;
+        logger.info(`  Codex output item: type=${item.type} name=${toolCall.function.name}`);
+
+        if (!emittedRole) {
+          emittedRole = true;
+          yield `data: ${JSON.stringify({
+            id: messageId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+          })}\n\n`;
+        }
+
+        yield `data: ${JSON.stringify({
+          id: messageId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: nextToolCallIndex++,
+                    id: toolCall.id,
+                    type: 'function',
+                    function: {
+                      name: toolCall.function.name,
+                      arguments: toolCall.function.arguments,
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        })}\n\n`;
+        continue;
+      }
+
+      if (!sawOutputTextDelta) {
+        const outputText = extractTextFromCodexOutputItem(item);
+        if (outputText.length > 0) {
+          if (!emittedRole) {
+            emittedRole = true;
+            yield `data: ${JSON.stringify({
+              id: messageId,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model,
+              choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+            })}\n\n`;
+          }
+
+          yield `data: ${JSON.stringify({
+            id: messageId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: { content: outputText }, finish_reason: null }],
+          })}\n\n`;
+        }
+      }
       continue;
     }
 
@@ -773,7 +1052,7 @@ async function* translateCodexResponsesStreamToChatCompletions(
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    choices: [{ index: 0, delta: {}, finish_reason: sawToolCall ? 'tool_calls' : 'stop' }],
     usage: buildOpenAICompletionUsage(usage),
   })}\n\n`;
   yield 'data: [DONE]\n\n';
@@ -845,7 +1124,7 @@ Usage: npm run router [options]
 Options:
   -h, --help                    Show this help message
   -v, --version                 Show version number
-  -p, --port PORT               Port to listen on (default: 3000)
+  -p, --port PORT               Port to listen on (default: 3344)
 
   Endpoint control (default: both enabled):
   --enable-anthropic             Enable Anthropic /v1/messages endpoint
@@ -882,7 +1161,7 @@ Examples:
 `);
 }
 
-let PORT = process.env.ROUTER_PORT ? parseInt(process.env.ROUTER_PORT) : 3000;
+let PORT = process.env.ROUTER_PORT ? parseInt(process.env.ROUTER_PORT) : 3344;
 parseArgs();
 
 const app = express();
@@ -953,7 +1232,10 @@ function extractAnthropicModels(payload: unknown): Record<string, unknown>[] {
 function getCachedSubscriptionAvailability(): Record<Provider, boolean> {
   return {
     openai: endpointConfig.openaiEnabled && modelCache.openai.models.length > 0,
-    anthropic: endpointConfig.anthropicEnabled && modelCache.anthropic.models.length > 0,
+    anthropic:
+      endpointConfig.anthropicEnabled &&
+      anthropicAuthConfigured &&
+      modelCache.anthropic.models.length > 0,
   };
 }
 
@@ -1021,6 +1303,20 @@ function resolveProviderAndModel(
     provider,
     model: remapModelForProvider(provider, normalizedModel),
   };
+}
+
+function logRoutingDecision(
+  req: Request,
+  requestedModel: string,
+  resolvedProvider: Provider,
+  resolvedModel: string
+): void {
+  const hintedProvider = resolveProviderHint(req, { model: requestedModel });
+  const requestedModelProvider = classifyModelProvider(requestedModel);
+  const availability = getCachedSubscriptionAvailability();
+  logger.info(
+    `  Routing decision: model=${requestedModel} model_provider=${requestedModelProvider || 'unknown'} hinted=${hintedProvider || 'none'} openai_available=${availability.openai} anthropic_available=${availability.anthropic} resolved_provider=${resolvedProvider} resolved_model=${resolvedModel}`
+  );
 }
 
 function normalizeOpenRouterModelList(): Record<string, unknown>[] {
@@ -1312,6 +1608,7 @@ const handleMessagesRequest = async (req: Request, res: Response) => {
       routedSelection.model === normalizedRequest.model
         ? normalizedRequest
         : { ...normalizedRequest, model: routedSelection.model };
+    logRoutingDecision(req, normalizedRequest.model, routedSelection.provider, routedSelection.model);
     const hadSystemPrompt = !!(routedRequest.system && routedRequest.system.length > 0);
     const provider = routedSelection.provider;
 
@@ -1374,6 +1671,8 @@ const handleMessagesRequest = async (req: Request, res: Response) => {
 
       if (!response.ok) {
         const errorText = await response.text();
+        logger.info(`  ChatGPT request body: ${JSON.stringify(codexRequest)}`);
+        logger.info(`  ChatGPT response body: ${errorText}`);
         const errorData = {
           error: {
             message: errorText || `ChatGPT backend error (${response.status})`,
@@ -1511,6 +1810,7 @@ const handleChatCompletionsRequest = async (req: Request, res: Response) => {
       routedSelection.model === openaiRequest.model
         ? openaiRequest
         : { ...openaiRequest, model: routedSelection.model };
+    logRoutingDecision(req, openaiRequest.model, routedSelection.provider, routedSelection.model);
     const provider = routedSelection.provider;
     if (provider === 'anthropic') {
       const anthropicRequest = translateOpenAIToAnthropic(routedOpenAIRequest);
@@ -1747,6 +2047,12 @@ const handleResponsesRequest = async (req: Request, res: Response) => {
       routedSelection.model === normalizedOpenAIRequest.model
         ? normalizedOpenAIRequest
         : { ...normalizedOpenAIRequest, model: routedSelection.model };
+    logRoutingDecision(
+      req,
+      normalizedOpenAIRequest.model,
+      routedSelection.provider,
+      routedSelection.model
+    );
 
     if (routedSelection.provider === 'openai') {
       const authorization = await getOpenAIAuthorization(req);
@@ -1774,6 +2080,8 @@ const handleResponsesRequest = async (req: Request, res: Response) => {
 
       if (!response.ok) {
         const errorText = await response.text();
+        logger.info(`  ChatGPT request body: ${JSON.stringify(codexRequest)}`);
+        logger.info(`  ChatGPT response body: ${errorText}`);
         res.status(response.status).json({
           error: {
             message: errorText || `ChatGPT backend error (${response.status})`,
@@ -1981,21 +2289,17 @@ async function startRouter() {
   }
 
   const hasAnthropicOAuthToken = Boolean(tokens?.access_token);
+  anthropicAuthConfigured = hasAnthropicOAuthToken;
   const anthropicAvailability = !endpointConfig.anthropicEnabled
     ? 'disabled'
     : hasAnthropicOAuthToken
       ? 'available'
       : 'not available';
-  const bearerPassthroughState = endpointConfig.allowBearerPassthrough ? 'enabled' : 'disabled';
   const anthropicAvailabilityDetails = !endpointConfig.anthropicEnabled
     ? 'disabled via router flag'
     : hasAnthropicOAuthToken
-      ? endpointConfig.allowBearerPassthrough
-        ? 'router OAuth token or bearer passthrough'
-        : 'router OAuth token'
-      : endpointConfig.allowBearerPassthrough
-        ? 'bearer passthrough only'
-        : 'missing OAuth token';
+      ? 'router OAuth token'
+      : 'missing OAuth token';
 
   rl.close();
   logger.startup('');
@@ -2028,7 +2332,6 @@ async function startRouter() {
     logger.startup(
       `   Anthropic: ${anthropicAvailability} (${anthropicAvailabilityDetails})`
     );
-    logger.startup(`   Bearer passthrough: ${bearerPassthroughState}`);
     logger.startup(
       `   OpenAI auth: ${openAIAuth.sourceConfigured ? 'configured' : 'missing'} (env key or saved key)`
     );

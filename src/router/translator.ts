@@ -11,6 +11,7 @@
 
 import {
   OpenAIChatCompletionRequest,
+  OpenAIContentPart,
   OpenAIMessage,
   OpenAITool,
   OpenAIChatCompletionResponse,
@@ -25,68 +26,278 @@ import {
 import { mapOpenAIModelToAnthropic } from './model-mapper.js';
 import { mapAnthropicModelToOpenAI } from './model-mapper.js';
 
+function extractTextFromOpenAIContent(content: OpenAIMessage['content']): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return '';
+  }
+
+  return content
+    .map((part) => (part.type === 'text' ? part.text : ''))
+    .filter((part) => part.trim().length > 0)
+    .join('\n\n');
+}
+
+function openAIImagePartToAnthropicBlock(part: OpenAIContentPart): ContentBlock | null {
+  if (part.type !== 'image_url' || typeof part.image_url?.url !== 'string') {
+    return null;
+  }
+
+  const imageUrl = part.image_url.url.trim();
+  if (imageUrl.length === 0) {
+    return null;
+  }
+
+  const dataUriMatch = imageUrl.match(/^data:([^;,]+);base64,(.+)$/);
+  if (dataUriMatch) {
+    return {
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: dataUriMatch[1],
+        data: dataUriMatch[2],
+      },
+    } as ContentBlock;
+  }
+
+  return {
+    type: 'image',
+    source: {
+      type: 'url',
+      url: imageUrl,
+    },
+  } as ContentBlock;
+}
+
+function translateOpenAIContentToAnthropicBlocks(
+  content: OpenAIMessage['content']
+): ContentBlock[] {
+  if (typeof content === 'string') {
+    const trimmedContent = content.trim();
+    return trimmedContent.length > 0 ? [{ type: 'text', text: trimmedContent }] : [];
+  }
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content.flatMap((part) => {
+    if (part.type === 'text') {
+      const trimmedText = part.text.trim();
+      return trimmedText.length > 0 ? [{ type: 'text', text: trimmedText }] : [];
+    }
+
+    const imageBlock = openAIImagePartToAnthropicBlock(part);
+    return imageBlock ? [imageBlock] : [];
+  });
+}
+
+function anthropicImageBlockToOpenAIContentPart(
+  block: Record<string, unknown>
+): OpenAIContentPart | null {
+  const source =
+    block.source && typeof block.source === 'object'
+      ? (block.source as Record<string, unknown>)
+      : null;
+  if (!source || typeof source.type !== 'string') {
+    return null;
+  }
+
+  if (source.type === 'url' && typeof source.url === 'string' && source.url.trim().length > 0) {
+    return {
+      type: 'image_url',
+      image_url: {
+        url: source.url.trim(),
+      },
+    };
+  }
+
+  if (
+    source.type === 'base64' &&
+    typeof source.data === 'string' &&
+    typeof source.media_type === 'string' &&
+    source.data.trim().length > 0
+  ) {
+    return {
+      type: 'image_url',
+      image_url: {
+        url: `data:${source.media_type};base64,${source.data}`,
+      },
+    };
+  }
+
+  return null;
+}
+
+function translateAnthropicBlocksToOpenAIContent(
+  blocks: ContentBlock[]
+): OpenAIMessageType['content'] {
+  const contentParts: OpenAIContentPart[] = [];
+  const toolMarkers: string[] = [];
+
+  for (const block of blocks) {
+    if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+      contentParts.push({
+        type: 'text',
+        text: block.text,
+      });
+      continue;
+    }
+
+    if (block.type === 'image') {
+      const imagePart = anthropicImageBlockToOpenAIContentPart(block as Record<string, unknown>);
+      if (imagePart) {
+        contentParts.push(imagePart);
+      }
+      continue;
+    }
+
+    if (block.type === 'tool_use') {
+      toolMarkers.push(`[tool_use:${String(block.id ?? 'unknown')}]`);
+      continue;
+    }
+
+    if (block.type === 'tool_result') {
+      toolMarkers.push(`[tool_result:${String(block.tool_use_id ?? block.id ?? 'unknown')}]`);
+    }
+  }
+
+  if (toolMarkers.length > 0) {
+    contentParts.push({
+      type: 'text',
+      text: toolMarkers.join('\n\n'),
+    });
+  }
+
+  if (contentParts.length === 0) {
+    return null;
+  }
+
+  if (contentParts.every((part) => part.type === 'text')) {
+    return contentParts.map((part) => part.text).join('\n\n');
+  }
+
+  return contentParts;
+}
+
 /**
  * Translate OpenAI Chat Completion request to Anthropic Messages API request
  */
 export function translateOpenAIToAnthropic(
   openaiRequest: OpenAIChatCompletionRequest
 ): AnthropicRequest {
-  // Extract and combine all system messages
   const systemMessages: string[] = [];
-  const conversationMessages: OpenAIMessage[] = [];
+  const anthropicMessages: Message[] = [];
+
+  const appendAnthropicMessage = (
+    role: 'user' | 'assistant',
+    content: string | ContentBlock[]
+  ): void => {
+    const normalizedContent =
+      typeof content === 'string'
+        ? content.trim()
+        : content.filter((block) => {
+            if (block.type === 'text') {
+              return typeof block.text === 'string' && block.text.trim().length > 0;
+            }
+            return true;
+          });
+
+    if (
+      (typeof normalizedContent === 'string' && normalizedContent.length === 0) ||
+      (Array.isArray(normalizedContent) && normalizedContent.length === 0)
+    ) {
+      return;
+    }
+
+    const previousMessage = anthropicMessages[anthropicMessages.length - 1];
+    if (!previousMessage || previousMessage.role !== role) {
+      anthropicMessages.push({ role, content: normalizedContent });
+      return;
+    }
+
+    if (typeof previousMessage.content === 'string' && typeof normalizedContent === 'string') {
+      previousMessage.content = `${previousMessage.content}\n\n${normalizedContent}`;
+      return;
+    }
+
+    const previousBlocks =
+      typeof previousMessage.content === 'string'
+        ? [{ type: 'text', text: previousMessage.content } satisfies ContentBlock]
+        : previousMessage.content;
+    const nextBlocks =
+      typeof normalizedContent === 'string'
+        ? [{ type: 'text', text: normalizedContent } satisfies ContentBlock]
+        : normalizedContent;
+    previousMessage.content = [...previousBlocks, ...nextBlocks];
+  };
 
   for (const msg of openaiRequest.messages) {
     if (msg.role === 'system') {
-      systemMessages.push(msg.content || '');
-    } else {
-      conversationMessages.push(msg);
-    }
-  }
-
-  // Consolidate consecutive same-role messages for Anthropic's alternation requirement
-  const anthropicMessages: Message[] = [];
-  let currentRole: 'user' | 'assistant' | null = null;
-  let currentContent: string[] = [];
-
-  for (const msg of conversationMessages) {
-    if (msg.role === 'tool') {
-      // Skip tool messages for now - they need special handling
+      const systemText = extractTextFromOpenAIContent(msg.content).trim();
+      if (systemText.length > 0) {
+        systemMessages.push(systemText);
+      }
       continue;
     }
 
-    const role = msg.role as 'user' | 'assistant';
+    if (msg.role === 'tool') {
+      const toolResultText = extractTextFromOpenAIContent(msg.content).trim();
+      appendAnthropicMessage('user', [
+        {
+          type: 'tool_result',
+          tool_use_id: msg.tool_call_id || 'unknown',
+          content: toolResultText.length > 0 ? toolResultText : '[empty tool result]',
+        } as ContentBlock,
+      ]);
+      continue;
+    }
 
-    if (role === currentRole) {
-      // Same role, accumulate content
-      currentContent.push(msg.content || '');
-    } else {
-      // Role changed, flush current message
-      if (currentRole && currentContent.length > 0) {
-        anthropicMessages.push({
-          role: currentRole,
-          content: currentContent.join('\n\n'),
-        });
+    if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+      const contentBlocks: ContentBlock[] = [];
+      contentBlocks.push(...translateOpenAIContentToAnthropicBlocks(msg.content));
+
+      for (const toolCall of msg.tool_calls) {
+        let parsedArguments: Record<string, unknown> = {};
+        try {
+          parsedArguments = toolCall.function.arguments
+            ? (JSON.parse(toolCall.function.arguments) as Record<string, unknown>)
+            : {};
+        } catch {
+          parsedArguments = { raw: toolCall.function.arguments };
+        }
+
+        contentBlocks.push({
+          type: 'tool_use',
+          id: toolCall.id,
+          name: toolCall.function.name,
+          input: parsedArguments,
+        } as ContentBlock);
       }
-      currentRole = role;
-      currentContent = [msg.content || ''];
+
+      appendAnthropicMessage('assistant', contentBlocks);
+      continue;
+    }
+
+    const contentBlocks = translateOpenAIContentToAnthropicBlocks(msg.content);
+    if (contentBlocks.length > 0) {
+      appendAnthropicMessage(
+        msg.role as 'user' | 'assistant',
+        contentBlocks.length === 1 && contentBlocks[0].type === 'text'
+          ? String(contentBlocks[0].text)
+          : contentBlocks
+      );
     }
   }
 
-  // Flush final message
-  if (currentRole && currentContent.length > 0) {
-    anthropicMessages.push({
-      role: currentRole,
-      content: currentContent.join('\n\n'),
-    });
-  }
-
-  // Translate tools if present
   let anthropicTools: Tool[] | undefined;
   if (openaiRequest.tools && openaiRequest.tools.length > 0) {
     anthropicTools = openaiRequest.tools.map(translateOpenAIToolToAnthropic);
   }
 
-  // Build the Anthropic request
   const anthropicRequest: AnthropicRequest = {
     model: mapOpenAIModelToAnthropic(openaiRequest.model),
     max_tokens: openaiRequest.max_tokens || 4096,
@@ -104,9 +315,21 @@ export function translateOpenAIToAnthropic(
     ];
   }
 
-  // Add tools if present
   if (anthropicTools && anthropicTools.length > 0) {
     anthropicRequest.tools = anthropicTools;
+  }
+
+  if (openaiRequest.tool_choice) {
+    if (openaiRequest.tool_choice === 'auto') {
+      anthropicRequest.tool_choice = { type: 'auto' };
+    } else if (openaiRequest.tool_choice === 'none') {
+      anthropicRequest.tool_choice = { type: 'auto' };
+    } else if (openaiRequest.tool_choice.type === 'function') {
+      anthropicRequest.tool_choice = {
+        type: 'tool',
+        name: openaiRequest.tool_choice.function.name,
+      };
+    }
   }
 
   return anthropicRequest;
@@ -136,26 +359,11 @@ export function translateAnthropicToOpenAIRequest(
       continue;
     }
 
-    const textContent = message.content
-      .filter((block): block is { type: 'text'; text: string } => block.type === 'text' && !!block.text)
-      .map((block) => block.text)
-      .join('\n\n');
-
-    const toolUseBlocks = message.content.filter((block) => block.type === 'tool_use');
-    const toolResultBlocks = message.content.filter((block) => block.type === 'tool_result');
-
-    if (textContent.length > 0 || toolUseBlocks.length > 0 || toolResultBlocks.length > 0) {
-      const toolContent = [
-        textContent,
-        ...toolUseBlocks.map((block) => `[tool_use:${String(block.id ?? 'unknown')}]`),
-        ...toolResultBlocks.map((block) => `[tool_result:${String(block.id ?? 'unknown')}]`),
-      ]
-        .filter((value) => value.length > 0)
-        .join('\n\n');
-
+    const translatedContent = translateAnthropicBlocksToOpenAIContent(message.content);
+    if (translatedContent !== null) {
       messages.push({
         role: message.role,
-        content: toolContent || '[unsupported content block omitted]',
+        content: translatedContent,
       });
     }
   }
@@ -353,6 +561,17 @@ export async function* translateAnthropicStreamToOpenAI(
   let buffer = '';
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
+  let sawToolCall = false;
+  let nextToolCallIndex = 0;
+  const toolBlocks = new Map<
+    number,
+    {
+      id: string;
+      name: string;
+      arguments: string;
+      emitted: boolean;
+    }
+  >();
 
   // Send initial chunk with role
   yield `data: ${JSON.stringify({
@@ -383,8 +602,26 @@ export async function* translateAnthropicStreamToOpenAI(
         try {
           const event = JSON.parse(data);
 
-          if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-            // Text content delta
+          if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+            const index = typeof event.index === 'number' ? event.index : null;
+            const toolUseId =
+              event.content_block && typeof event.content_block.id === 'string'
+                ? event.content_block.id
+                : null;
+            const toolName =
+              event.content_block && typeof event.content_block.name === 'string'
+                ? event.content_block.name
+                : null;
+
+            if (index !== null && toolUseId && toolName) {
+              toolBlocks.set(index, {
+                id: toolUseId,
+                name: toolName,
+                arguments: '',
+                emitted: false,
+              });
+            }
+          } else if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
             yield `data: ${JSON.stringify({
               id: messageId,
               object: 'chat.completion.chunk',
@@ -398,11 +635,56 @@ export async function* translateAnthropicStreamToOpenAI(
                 },
               ],
             })}\n\n`;
+          } else if (
+            event.type === 'content_block_delta' &&
+            event.delta?.type === 'input_json_delta'
+          ) {
+            const index = typeof event.index === 'number' ? event.index : null;
+            const partialJson =
+              typeof event.delta.partial_json === 'string' ? event.delta.partial_json : null;
+
+            if (index !== null && partialJson !== null) {
+              const toolBlock = toolBlocks.get(index);
+              if (toolBlock) {
+                toolBlock.arguments += partialJson;
+              }
+            }
+          } else if (event.type === 'content_block_stop') {
+            const index = typeof event.index === 'number' ? event.index : null;
+            const toolBlock = index !== null ? toolBlocks.get(index) : undefined;
+
+            if (toolBlock && !toolBlock.emitted) {
+              toolBlock.emitted = true;
+              sawToolCall = true;
+              yield `data: ${JSON.stringify({
+                id: messageId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: originalModel,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: nextToolCallIndex++,
+                          id: toolBlock.id,
+                          type: 'function',
+                          function: {
+                            name: toolBlock.name,
+                            arguments: toolBlock.arguments || '{}',
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              })}\n\n`;
+            }
           } else if (event.type === 'message_delta' && event.usage) {
-            // Update token counts
             totalOutputTokens = event.usage.output_tokens || totalOutputTokens;
           } else if (event.type === 'message_start' && event.message?.usage) {
-            // Initial token count
             totalInputTokens = event.message.usage.input_tokens || 0;
           }
         } catch {
@@ -422,7 +704,7 @@ export async function* translateAnthropicStreamToOpenAI(
       {
         index: 0,
         delta: {},
-        finish_reason: 'stop',
+        finish_reason: sawToolCall ? 'tool_calls' : 'stop',
       },
     ],
     usage: {

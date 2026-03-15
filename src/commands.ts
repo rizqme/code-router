@@ -156,7 +156,7 @@ async function buildOpenAIHeaders(): Promise<Record<string, string>> {
   return headers;
 }
 
-async function isRouterRunning(port = 3000): Promise<boolean> {
+async function isRouterRunning(port = 3344): Promise<boolean> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 1000);
 

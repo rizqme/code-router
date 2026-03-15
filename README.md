@@ -76,7 +76,7 @@ Examples:
 
 ```bash
 code-router
-code-router serve --port 3000 --verbose
+code-router serve --port 3344 --verbose
 code-router verify
 code-router models --provider openrouter
 code-router auth claude
@@ -155,13 +155,13 @@ The local server exposes:
 Default base URL:
 
 ```text
-http://localhost:3000
+http://localhost:3344
 ```
 
 OpenAI-compatible base URL:
 
 ```text
-http://localhost:3000/v1
+http://localhost:3344/v1
 ```
 
 ## Model listing
@@ -236,7 +236,7 @@ The `/v1/models` endpoint is served from in-memory cached model data when availa
 Anthropic-style request:
 
 ```bash
-curl -X POST http://localhost:3000/v1/messages \
+curl -X POST http://localhost:3344/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet-4-6",
@@ -250,7 +250,7 @@ curl -X POST http://localhost:3000/v1/messages \
 OpenAI-style request:
 
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
+curl -X POST http://localhost:3344/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-5.4",
@@ -263,7 +263,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 OpenRouter-style model name:
 
 ```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
+curl -X POST http://localhost:3344/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "anthropic/claude-sonnet-4-6",
@@ -309,3 +309,7 @@ code-router auth openai
 ## License
 
 MIT
+
+## Author
+
+Ahmad Rizqi Meydiarso
