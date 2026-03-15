@@ -25,13 +25,13 @@ It has two modes:
 Global install:
 
 ```bash
-npm install -g code-router
+npm install -g @rizqme/code-router
 ```
 
 Run without installing:
 
 ```bash
-npx code-router
+npx @rizqme/code-router
 ```
 
 ## Quick start
