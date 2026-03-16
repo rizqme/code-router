@@ -33,6 +33,13 @@ import {
   maskApiKey,
   getValidOpenAIAccessToken,
 } from './openai-token-manager.js';
+import { runCopilotOAuthFlow } from './copilot-oauth.js';
+import {
+  COPILOT_TOKEN_FILE,
+  loadCopilotAuthState,
+  saveCopilotAuthState,
+  maskToken,
+} from './copilot-token-manager.js';
 import type { OAuthTokens } from './types.js';
 
 const rl = readline.createInterface({
@@ -291,6 +298,18 @@ async function showAuthStatus() {
     console.log('❌ ChatGPT not configured\n');
   }
 
+  const copilotAuthState = await loadCopilotAuthState();
+  if (copilotAuthState) {
+    console.log('✅ Copilot configured');
+    console.log(`   Token: ${maskToken(copilotAuthState.accessToken)}`);
+    if (copilotAuthState.enterpriseUrl) {
+      console.log(`   Enterprise: ${copilotAuthState.enterpriseUrl}`);
+    }
+    console.log('');
+  } else {
+    console.log('❌ Copilot not configured\n');
+  }
+
   return tokens;
 }
 
@@ -358,6 +377,28 @@ async function handleAuthenticateChatGPTOAuth() {
   } catch (error) {
     console.error('\n❌ ChatGPT OAuth flow failed:', error instanceof Error ? error.message : error);
     console.log('   You can still use option 3 to set a ChatGPT API key manually.\n');
+  }
+}
+
+async function handleAuthenticateCopilotOAuth() {
+  printSection('COPILOT OAUTH');
+
+  const enterpriseUrl = (await question('Enterprise URL (leave blank for github.com): ')).trim();
+
+  try {
+    const result = await runCopilotOAuthFlow(enterpriseUrl || undefined);
+    await saveCopilotAuthState({
+      accessToken: result.accessToken,
+      enterpriseUrl: result.enterpriseUrl,
+      createdAt: new Date().toISOString(),
+    });
+    console.log('\n✅ Copilot OAuth authentication saved.\n');
+    console.log('Token:');
+    console.log(maskToken(result.accessToken));
+    console.log('\nRestart router to load updated auth if it is already running.\n');
+  } catch (error) {
+    console.error('\n❌ Copilot OAuth flow failed:', error instanceof Error ? error.message : error);
+    console.log('');
   }
 }
 
@@ -480,14 +521,18 @@ async function handleAuthenticateMenu() {
   console.log('\nOptions:');
   console.log('  1. Claude MAX OAuth');
   console.log('  2. ChatGPT OAuth');
-  console.log('  3. Back\n');
+  console.log('  3. Copilot OAuth');
+  console.log('  4. Back\n');
 
-  switch ((await question('Select option (1-3): ')).trim()) {
+  switch ((await question('Select option (1-4): ')).trim()) {
     case '1':
       await handleAuthenticate();
       return;
     case '2':
       await handleAuthenticateChatGPTOAuth();
+      return;
+    case '3':
+      await handleAuthenticateCopilotOAuth();
       return;
     default:
       return;
@@ -527,11 +572,12 @@ async function handleLogout() {
   console.log('\nOptions:');
   console.log('  1. Claude');
   console.log('  2. ChatGPT');
-  console.log('  3. Both');
-  console.log('  4. Back\n');
+  console.log('  3. Copilot');
+  console.log('  4. All');
+  console.log('  5. Back\n');
 
-  const choice = (await question('Select option (1-4): ')).trim();
-  if (choice === '4') {
+  const choice = (await question('Select option (1-5): ')).trim();
+  if (choice === '5') {
     return;
   }
 
@@ -541,12 +587,16 @@ async function handleLogout() {
     return;
   }
 
-  if (choice === '1' || choice === '3') {
+  if (choice === '1' || choice === '4') {
     await deleteIfExists(TOKEN_FILE);
   }
 
-  if (choice === '2' || choice === '3') {
+  if (choice === '2' || choice === '4') {
     await deleteIfExists(CHATGPT_KEY_FILE);
+  }
+
+  if (choice === '3' || choice === '4') {
+    await deleteIfExists(COPILOT_TOKEN_FILE);
   }
 
   console.log('\n✅ Stored credentials removed.\n');

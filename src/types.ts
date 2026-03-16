@@ -103,7 +103,7 @@ export interface AnthropicResponse {
   };
 }
 
-export type Provider = 'anthropic' | 'openai';
+export type Provider = 'anthropic' | 'openai' | 'copilot';
 
 export interface OpenAIResponsesRequest {
   [key: string]: unknown;

@@ -14,8 +14,16 @@ import {
   loadOpenAIAuthState,
   saveOpenAIAuthState,
 } from './openai-token-manager.js';
+import { runCopilotOAuthFlow } from './copilot-oauth.js';
+import {
+  COPILOT_TOKEN_FILE,
+  loadCopilotAuthState,
+  saveCopilotAuthState,
+  getValidCopilotAccessToken,
+  maskToken,
+} from './copilot-token-manager.js';
 
-export type ProviderSelection = 'all' | 'claude' | 'openai' | 'openrouter';
+export type ProviderSelection = 'all' | 'claude' | 'openai' | 'openrouter' | 'copilot';
 
 type StatusSnapshot = {
   routerRunning: boolean;
@@ -24,19 +32,22 @@ type StatusSnapshot = {
   claudeExpiresInMinutes: number | null;
   chatgptConfigured: boolean;
   chatgptSource: string | null;
+  copilotConfigured: boolean;
 };
 
 type ModelsResult = {
   claude?: string[];
   openai?: string[];
   openrouter?: string[];
-  errors: Partial<Record<'claude' | 'openai' | 'openrouter', string>>;
+  copilot?: string[];
+  errors: Partial<Record<'claude' | 'openai' | 'openrouter' | 'copilot', string>>;
 };
 
 type VerifyResult = {
   claude?: string;
   openai?: string;
-  errors: Partial<Record<'claude' | 'openai', string>>;
+  copilot?: string;
+  errors: Partial<Record<'claude' | 'openai' | 'copilot', string>>;
 };
 
 const OPENAI_MODELS_URL =
@@ -274,6 +285,37 @@ async function deleteIfExists(path: string): Promise<void> {
   }
 }
 
+async function verifyCopilotSubscription(): Promise<string> {
+  const accessToken = await getValidCopilotAccessToken();
+  const response = await fetch('https://api.githubcopilot.com/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'code-router/0.0.0',
+      'Openai-Intent': 'conversation-edits',
+      'x-initiator': 'user',
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'Reply with exactly: ok' }],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+
+  const payload = (await response.json()) as {
+    model?: string;
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const model = payload.model || 'unknown';
+  const text = payload.choices?.[0]?.message?.content?.trim() || '(empty response)';
+  return `${model} -> ${text}`;
+}
+
 export async function loadStatusSnapshot(): Promise<StatusSnapshot> {
   const tokens = await loadTokens();
   const chatGPTAuthState = await loadOpenAIAuthState();
@@ -286,6 +328,8 @@ export async function loadStatusSnapshot(): Promise<StatusSnapshot> {
       ? `${chatGPTAuthState.source} auth file`
       : null;
 
+  const copilotAuthState = await loadCopilotAuthState();
+
   return {
     routerRunning: await isRouterRunning(),
     claudeConfigured: Boolean(tokens),
@@ -294,6 +338,7 @@ export async function loadStatusSnapshot(): Promise<StatusSnapshot> {
       tokens?.expires_at ? Math.floor((tokens.expires_at - Date.now()) / 1000 / 60) : null,
     chatgptConfigured: chatGPTConfigured,
     chatgptSource: chatGPTSource,
+    copilotConfigured: Boolean(copilotAuthState?.accessToken),
   };
 }
 
@@ -306,6 +351,7 @@ export function formatStatusText(status: StatusSnapshot): string {
     `  ChatGPT: ${status.chatgptConfigured ? 'configured' : 'not configured'}${
       status.chatgptConfigured && status.chatgptSource ? ` (${status.chatgptSource})` : ''
     }`,
+    `  Copilot: ${status.copilotConfigured ? 'configured' : 'not configured'}`,
     `  Router: ${status.routerRunning ? 'running' : 'not running'}`,
   ];
 
@@ -316,6 +362,7 @@ export async function listModels(provider: ProviderSelection): Promise<ModelsRes
   const results: ModelsResult = { errors: {} };
   const wantsClaude = provider === 'all' || provider === 'claude' || provider === 'openrouter';
   const wantsOpenAI = provider === 'all' || provider === 'openai' || provider === 'openrouter';
+  const wantsCopilot = provider === 'all' || provider === 'copilot';
 
   const [claudeResult, openAIResult] = await Promise.allSettled([
     wantsClaude ? fetchAnthropicModels() : Promise.resolve([]),
@@ -336,6 +383,20 @@ export async function listModels(provider: ProviderSelection): Promise<ModelsRes
     } else {
       results.errors.openai = formatError(openAIResult.reason);
     }
+  }
+
+  if (wantsCopilot) {
+    results.copilot = [
+      'gpt-4o',
+      'gpt-4o-mini',
+      'gpt-4.1',
+      'gpt-4.1-mini',
+      'gpt-5',
+      'gpt-5-mini',
+      'claude-sonnet-4',
+      'claude-sonnet-4-6',
+      'o4-mini',
+    ];
   }
 
   if (provider === 'all' || provider === 'openrouter') {
@@ -382,6 +443,10 @@ export function formatModelsText(provider: ProviderSelection, models: ModelsResu
     pushSection('ChatGPT', models.openai, models.errors.openai);
   }
 
+  if (provider === 'all' || provider === 'copilot') {
+    pushSection('Copilot', models.copilot, models.errors.copilot);
+  }
+
   if (provider === 'all' || provider === 'openrouter') {
     pushSection('OpenRouter', models.openrouter, models.errors.openrouter);
   }
@@ -395,10 +460,12 @@ export async function verifySubscriptions(
   const results: VerifyResult = { errors: {} };
   const wantsClaude = provider === 'all' || provider === 'claude';
   const wantsOpenAI = provider === 'all' || provider === 'openai';
+  const wantsCopilot = provider === 'all' || provider === 'copilot';
 
-  const [claudeResult, openAIResult] = await Promise.allSettled([
+  const [claudeResult, openAIResult, copilotResult] = await Promise.allSettled([
     wantsClaude ? verifyAnthropicSubscription() : Promise.resolve(''),
     wantsOpenAI ? verifyOpenAISubscription() : Promise.resolve(''),
+    wantsCopilot ? verifyCopilotSubscription() : Promise.resolve(''),
   ]);
 
   if (wantsClaude) {
@@ -414,6 +481,14 @@ export async function verifySubscriptions(
       results.openai = openAIResult.value;
     } else {
       results.errors.openai = formatError(openAIResult.reason);
+    }
+  }
+
+  if (wantsCopilot) {
+    if (copilotResult.status === 'fulfilled') {
+      results.copilot = copilotResult.value;
+    } else {
+      results.errors.copilot = formatError(copilotResult.reason);
     }
   }
 
@@ -435,6 +510,12 @@ export function formatVerifyText(
   if (provider === 'all' || provider === 'openai') {
     lines.push(
       results.openai ? `ChatGPT: OK ${results.openai}` : `ChatGPT: ERROR ${results.errors.openai}`
+    );
+  }
+
+  if (provider === 'all' || provider === 'copilot') {
+    lines.push(
+      results.copilot ? `Copilot: OK ${results.copilot}` : `Copilot: ERROR ${results.errors.copilot}`
     );
   }
 
@@ -479,12 +560,25 @@ export async function runOpenAIOAuth(): Promise<void> {
   }
 }
 
-export async function logout(target: 'claude' | 'openai' | 'all'): Promise<void> {
+export async function runCopilotOAuth(enterpriseUrl?: string): Promise<void> {
+  const result = await runCopilotOAuthFlow(enterpriseUrl);
+  await saveCopilotAuthState({
+    accessToken: result.accessToken,
+    enterpriseUrl: result.enterpriseUrl,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+export async function logout(target: 'claude' | 'openai' | 'copilot' | 'all'): Promise<void> {
   if (target === 'claude' || target === 'all') {
     await deleteIfExists(TOKEN_FILE);
   }
 
   if (target === 'openai' || target === 'all') {
     await deleteIfExists(CHATGPT_KEY_FILE);
+  }
+
+  if (target === 'copilot' || target === 'all') {
+    await deleteIfExists(COPILOT_TOKEN_FILE);
   }
 }
