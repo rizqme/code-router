@@ -138,6 +138,66 @@ export function mapAnthropicModelToOpenAI(modelName: string): string {
 }
 
 /**
+ * Check if a model name is a Copilot-native model (GPT or OpenAI family)
+ */
+export function isCopilotNativeModel(modelName: string): boolean {
+  const normalized = modelName.toLowerCase();
+  return (
+    normalized.startsWith('gpt-') ||
+    normalized.startsWith('o1') ||
+    normalized.startsWith('o3') ||
+    normalized.startsWith('o4')
+  );
+}
+
+/**
+ * Check if a model should use the Copilot Responses API instead of Chat Completions
+ */
+export function shouldUseCopilotResponsesApi(modelName: string): boolean {
+  const match = /^gpt-(\d+)/.exec(modelName);
+  if (!match) return false;
+  return Number(match[1]) >= 5 && !modelName.startsWith('gpt-5-mini');
+}
+
+/**
+ * Map any model name to one usable via Copilot
+ * Claude models get mapped to GPT equivalents, GPT models pass through
+ */
+export function mapModelToCopilot(modelName: string): string {
+  if (process.env.COPILOT_DEFAULT_MODEL) {
+    return process.env.COPILOT_DEFAULT_MODEL;
+  }
+
+  const normalized = modelName.toLowerCase();
+
+  // GPT and o-series models pass through directly
+  if (isCopilotNativeModel(normalized)) {
+    return modelName;
+  }
+
+  // Claude models are available through Copilot directly
+  if (normalized.startsWith('claude-')) {
+    return modelName;
+  }
+
+  // Map Anthropic-style names to GPT equivalents
+  if (normalized.includes('opus')) {
+    return 'gpt-4o';
+  }
+
+  if (normalized.includes('haiku')) {
+    return 'gpt-4o-mini';
+  }
+
+  if (normalized.includes('sonnet')) {
+    return 'gpt-4o';
+  }
+
+  // Default to gpt-4o
+  return 'gpt-4o';
+}
+
+/**
  * Get a description of which pattern matched for a given model
  * Used for logging/debugging
  */

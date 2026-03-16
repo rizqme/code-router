@@ -8,6 +8,9 @@ import {
   getValidOpenAIAccessToken,
   loadOpenAIAuthState,
 } from '../openai-token-manager.js';
+import { getValidCopilotAccessToken, loadCopilotAuthState, getCopilotEnterpriseUrl } from '../copilot-token-manager.js';
+import { getCopilotApiBaseUrl } from '../copilot-oauth.js';
+import { shouldUseCopilotResponsesApi, mapModelToCopilot } from './model-mapper.js';
 import { ensureRequiredSystemPrompt, stripUnknownFields } from './middleware.js';
 import {
   AnthropicRequest,
@@ -82,6 +85,11 @@ let openAIAuth = {
   authorization: null as string | null,
   accountId: undefined as string | undefined,
 };
+let copilotAuth = {
+  sourceConfigured: false,
+  authorization: null as string | null,
+  enterpriseUrl: undefined as string | undefined,
+};
 let anthropicAuthConfigured = false;
 
 type OpenAIAuthContext = {
@@ -98,6 +106,7 @@ function normalizeProvider(value: string | null | undefined): Provider | null {
   const normalized = value.toLowerCase().trim();
   if (normalized === 'openai') return 'openai';
   if (normalized === 'anthropic' || normalized === 'claude') return 'anthropic';
+  if (normalized === 'copilot' || normalized === 'github-copilot') return 'copilot';
   return null;
 }
 
@@ -215,6 +224,43 @@ function buildOpenAIRequestHeaders(
   return headers;
 }
 
+function detectVisionContent(messages: OpenAIMessage[]): boolean {
+  return messages.some(
+    (msg) =>
+      Array.isArray(msg.content) &&
+      msg.content.some((part) => part.type === 'image_url')
+  );
+}
+
+function detectAgentMode(messages: OpenAIMessage[]): boolean {
+  if (messages.length === 0) return false;
+  const last = messages[messages.length - 1];
+  return last.role !== 'user';
+}
+
+function buildCopilotRequestHeaders(
+  accessToken: string,
+  requestId: string,
+  messages: OpenAIMessage[]
+): Record<string, string> {
+  const isVision = detectVisionContent(messages);
+  const isAgent = detectAgentMode(messages);
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'User-Agent': `code-router/${packageJson.version}`,
+    Authorization: `Bearer ${accessToken}`,
+    'Openai-Intent': 'conversation-edits',
+    'x-initiator': isAgent ? 'agent' : 'user',
+  };
+
+  if (isVision) {
+    headers['Copilot-Vision-Request'] = 'true';
+  }
+
+  return headers;
+}
+
 function logOutgoingRequest(
   provider: 'anthropic' | 'openai',
   method: string,
@@ -259,12 +305,16 @@ function resolveChatProvider(req: Request, request?: OpenAIProviderHint): Provid
   const availability = getCachedSubscriptionAvailability();
   const requestedModelProvider = classifyModelProvider(request?.model);
 
-  if (availability.openai && !availability.anthropic) {
+  if (availability.openai && !availability.anthropic && !availability.copilot) {
     return 'openai';
   }
 
-  if (availability.anthropic && !availability.openai) {
+  if (availability.anthropic && !availability.openai && !availability.copilot) {
     return 'anthropic';
+  }
+
+  if (availability.copilot && !availability.openai && !availability.anthropic) {
+    return 'copilot';
   }
 
   if (requestedModelProvider === 'openai' && availability.openai) {
@@ -273,6 +323,10 @@ function resolveChatProvider(req: Request, request?: OpenAIProviderHint): Provid
 
   if (requestedModelProvider === 'anthropic' && availability.anthropic) {
     return 'anthropic';
+  }
+
+  if (hinted === 'copilot' && copilotAuth.sourceConfigured) {
+    return 'copilot';
   }
 
   if (hinted) {
@@ -466,6 +520,28 @@ async function hydrateOpenAIAuthState(): Promise<void> {
     source: null,
     authorization: null,
     accountId: undefined,
+  };
+}
+
+async function hydrateCopilotAuthState(): Promise<void> {
+  if (copilotAuth.sourceConfigured && copilotAuth.authorization) {
+    return;
+  }
+
+  const state = await loadCopilotAuthState();
+  if (state?.accessToken) {
+    copilotAuth = {
+      sourceConfigured: true,
+      authorization: state.accessToken,
+      enterpriseUrl: state.enterpriseUrl,
+    };
+    return;
+  }
+
+  copilotAuth = {
+    sourceConfigured: false,
+    authorization: null,
+    enterpriseUrl: undefined,
   };
 }
 
@@ -1201,6 +1277,13 @@ const modelCache: Record<Provider, CachedModelState> = {
     lastError: null,
     refreshing: null,
   },
+  copilot: {
+    raw: null,
+    models: [],
+    fetchedAt: null,
+    lastError: null,
+    refreshing: null,
+  },
 };
 
 function extractOpenAIModels(payload: unknown): Record<string, unknown>[] {
@@ -1236,6 +1319,7 @@ function getCachedSubscriptionAvailability(): Record<Provider, boolean> {
       endpointConfig.anthropicEnabled &&
       anthropicAuthConfigured &&
       modelCache.anthropic.models.length > 0,
+    copilot: copilotAuth.sourceConfigured,
   };
 }
 
@@ -1278,6 +1362,10 @@ function getLatestAnthropicSonnetModel(): string {
 
 function remapModelForProvider(provider: Provider, requestedModel: string): string {
   const requestedProvider = classifyModelProvider(requestedModel);
+
+  if (provider === 'copilot') {
+    return mapModelToCopilot(requestedModel);
+  }
 
   if (provider === 'openai' && requestedProvider === 'anthropic') {
     return getLatestOpenAIModel();
@@ -1716,6 +1804,100 @@ const handleMessagesRequest = async (req: Request, res: Response) => {
       return;
     }
 
+    if (provider === 'copilot') {
+      const openaiRequest = translateAnthropicToOpenAIRequest(routedRequest);
+      const copilotToken = await getValidCopilotAccessToken();
+      const baseUrl = getCopilotApiBaseUrl(copilotAuth.enterpriseUrl);
+      const copilotHeaders = buildCopilotRequestHeaders(copilotToken, requestId, openaiRequest.messages);
+
+      const useCopilotResponsesApi = shouldUseCopilotResponsesApi(openaiRequest.model);
+      const copilotUrl = useCopilotResponsesApi
+        ? `${baseUrl}/responses`
+        : `${baseUrl}/chat/completions`;
+
+      let copilotBody: unknown;
+      if (useCopilotResponsesApi) {
+        copilotBody = convertChatCompletionsToResponsesRequest(openaiRequest);
+      } else {
+        copilotBody = openaiRequest;
+      }
+
+      logOutgoingRequest('openai', 'POST', copilotUrl, copilotHeaders, copilotBody);
+
+      const response = await fetch(copilotUrl, {
+        method: 'POST',
+        headers: copilotHeaders,
+        body: JSON.stringify(copilotBody),
+      });
+
+      if (openaiRequest.stream && response.headers.get('content-type')?.includes('text/event-stream')) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.status(response.status);
+
+        const messageId = `chatcmpl-${requestId}`;
+        if (useCopilotResponsesApi) {
+          const codexStream = translateCodexResponsesStreamToChatCompletions(
+            response.body as AsyncIterable<Uint8Array>,
+            formatModelForApiMode(openaiRequest.model, apiMode),
+            messageId
+          );
+          const translatedStream = translateOpenAIStreamToAnthropic(
+            encodeStringStream(codexStream),
+            formatModelForApiMode(openaiRequest.model, apiMode),
+            messageId
+          );
+          await streamResponse(res, translatedStream);
+        } else {
+          const translatedStream = translateOpenAIStreamToAnthropic(
+            response.body as AsyncIterable<Uint8Array>,
+            formatModelForApiMode(openaiRequest.model, apiMode),
+            messageId
+          );
+          await streamResponse(res, translatedStream);
+        }
+
+        logger.logRequest(requestId, timestamp, routedRequest, hadSystemPrompt,
+          { status: response.status, data: undefined }, undefined, 'openai');
+        return;
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        const errorData = {
+          error: {
+            message: errorText || `Copilot backend error (${response.status})`,
+            type: 'invalid_request_error',
+            param: null,
+            code: null,
+          },
+        } satisfies OpenAIErrorResponse;
+        const anthropicError = translateOpenAIErrorToAnthropic(errorData);
+        res.status(response.status).json(anthropicError);
+        return;
+      }
+
+      let openaiResponse: OpenAIChatCompletionResponse;
+      if (useCopilotResponsesApi) {
+        openaiResponse = await readCodexResponsesAsChatCompletion(
+          response.body as AsyncIterable<Uint8Array>,
+          formatModelForApiMode(openaiRequest.model, apiMode)
+        );
+      } else {
+        openaiResponse = (await response.json()) as OpenAIChatCompletionResponse;
+      }
+
+      const anthropicResponse = translateOpenAIToAnthropicResponse(
+        openaiResponse,
+        formatModelForApiMode(routedRequest.model, apiMode)
+      );
+      logger.logRequest(requestId, timestamp, routedRequest, hadSystemPrompt,
+        { status: response.status, data: anthropicResponse }, undefined, 'openai');
+      res.status(response.status).json(anthropicResponse);
+      return;
+    }
+
     const modifiedRequest = ensureRequiredSystemPrompt(routedRequest);
 
     const clientBearerToken = extractBearerToken(req);
@@ -1898,6 +2080,77 @@ const handleChatCompletionsRequest = async (req: Request, res: Response) => {
         'openai'
       );
       res.status(response.status).json(openaiResponse);
+      return;
+    }
+
+    if (provider === 'copilot') {
+      const copilotToken = await getValidCopilotAccessToken();
+      const baseUrl = getCopilotApiBaseUrl(copilotAuth.enterpriseUrl);
+      const copilotHeaders = buildCopilotRequestHeaders(copilotToken, requestId, routedOpenAIRequest.messages);
+
+      const useCopilotResponsesApi = shouldUseCopilotResponsesApi(routedOpenAIRequest.model);
+      const copilotUrl = useCopilotResponsesApi
+        ? `${baseUrl}/responses`
+        : `${baseUrl}/chat/completions`;
+
+      let copilotBody: unknown;
+      if (useCopilotResponsesApi) {
+        copilotBody = convertChatCompletionsToResponsesRequest(routedOpenAIRequest);
+      } else {
+        copilotBody = routedOpenAIRequest;
+      }
+
+      logOutgoingRequest('openai', 'POST', copilotUrl, copilotHeaders, copilotBody);
+
+      const response = await fetch(copilotUrl, {
+        method: 'POST',
+        headers: copilotHeaders,
+        body: JSON.stringify(copilotBody),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        res.status(response.status).json({
+          error: {
+            message: errorText || `Copilot backend error (${response.status})`,
+            type: 'invalid_request_error',
+            param: null,
+            code: null,
+          },
+        } satisfies OpenAIErrorResponse);
+        return;
+      }
+
+      if (routedOpenAIRequest.stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.status(response.status);
+
+        const messageId = `chatcmpl-${requestId}`;
+        if (useCopilotResponsesApi) {
+          const translatedStream = translateCodexResponsesStreamToChatCompletions(
+            response.body as AsyncIterable<Uint8Array>,
+            formatModelForApiMode(routedOpenAIRequest.model, apiMode),
+            messageId
+          );
+          await streamResponse(res, translatedStream);
+        } else {
+          await streamResponse(res, response.body as AsyncIterable<Uint8Array>);
+        }
+        return;
+      }
+
+      if (useCopilotResponsesApi) {
+        const responseData = await readCodexResponsesAsChatCompletion(
+          response.body as AsyncIterable<Uint8Array>,
+          formatModelForApiMode(routedOpenAIRequest.model, apiMode)
+        );
+        res.status(response.status).json(responseData);
+      } else {
+        const data = await response.json();
+        res.status(response.status).json(data);
+      }
       return;
     }
 
@@ -2117,6 +2370,77 @@ const handleResponsesRequest = async (req: Request, res: Response) => {
       return;
     }
 
+    if (routedSelection.provider === 'copilot') {
+      const copilotToken = await getValidCopilotAccessToken();
+      const baseUrl = getCopilotApiBaseUrl(copilotAuth.enterpriseUrl);
+      const copilotHeaders = buildCopilotRequestHeaders(copilotToken, requestId, routedOpenAIRequest.messages);
+
+      const useCopilotResponsesApi = shouldUseCopilotResponsesApi(routedOpenAIRequest.model);
+      const copilotUrl = useCopilotResponsesApi
+        ? `${baseUrl}/responses`
+        : `${baseUrl}/chat/completions`;
+
+      let copilotBody: unknown;
+      if (useCopilotResponsesApi) {
+        copilotBody = convertChatCompletionsToResponsesRequest(routedOpenAIRequest);
+      } else {
+        copilotBody = routedOpenAIRequest;
+      }
+
+      logOutgoingRequest('openai', 'POST', copilotUrl, copilotHeaders, copilotBody);
+
+      const response = await fetch(copilotUrl, {
+        method: 'POST',
+        headers: copilotHeaders,
+        body: JSON.stringify(copilotBody),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        res.status(response.status).json({
+          error: {
+            message: errorText || `Copilot backend error (${response.status})`,
+            type: 'invalid_request_error',
+            param: null,
+            code: null,
+          },
+        } satisfies OpenAIErrorResponse);
+        return;
+      }
+
+      if (routedOpenAIRequest.stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.status(response.status);
+
+        const messageId = `chatcmpl-${requestId}`;
+        if (useCopilotResponsesApi) {
+          const translatedStream = translateCodexResponsesStreamToChatCompletions(
+            response.body as AsyncIterable<Uint8Array>,
+            formatModelForApiMode(routedOpenAIRequest.model, apiMode),
+            messageId
+          );
+          await streamResponse(res, translatedStream);
+        } else {
+          await streamResponse(res, response.body as AsyncIterable<Uint8Array>);
+        }
+        return;
+      }
+
+      if (useCopilotResponsesApi) {
+        const responseData = await readCodexResponsesAsChatCompletion(
+          response.body as AsyncIterable<Uint8Array>,
+          formatModelForApiMode(routedOpenAIRequest.model, apiMode)
+        );
+        res.status(response.status).json(responseData);
+      } else {
+        const data = await response.json();
+        res.status(response.status).json(data);
+      }
+      return;
+    }
+
     const anthropicRequest = translateOpenAIToAnthropic(routedOpenAIRequest);
     const hadSystemPrompt = !!(anthropicRequest.system && anthropicRequest.system.length > 0);
     const modifiedRequest = ensureRequiredSystemPrompt(anthropicRequest);
@@ -2242,6 +2566,7 @@ if (endpointConfig.anthropicEnabled || endpointConfig.openaiEnabled) {
 
 async function startRouter() {
   await hydrateOpenAIAuthState();
+  await hydrateCopilotAuthState();
 
   logger.startup('');
   logger.startup('██████╗ ██████╗ ██████╗ ███████╗');
@@ -2334,6 +2659,11 @@ async function startRouter() {
     );
     logger.startup(
       `   OpenAI auth: ${openAIAuth.sourceConfigured ? 'configured' : 'missing'} (env key or saved key)`
+    );
+    logger.startup(
+      `   Copilot auth: ${copilotAuth.sourceConfigured ? 'configured' : 'missing'}${
+        copilotAuth.enterpriseUrl ? ` (enterprise: ${copilotAuth.enterpriseUrl})` : ''
+      }`
     );
     logger.startup('');
   });

@@ -13,6 +13,7 @@ import {
   logout,
   runClaudeOAuth,
   runOpenAIOAuth,
+  runCopilotOAuth,
   verifySubscriptions,
   type ProviderSelection,
 } from '../commands.js';
@@ -106,7 +107,8 @@ function normalizeProviderSelection(value: string): ProviderSelection {
     normalized === 'all' ||
     normalized === 'claude' ||
     normalized === 'openai' ||
-    normalized === 'openrouter'
+    normalized === 'openrouter' ||
+    normalized === 'copilot'
   ) {
     return normalized;
   }
@@ -123,10 +125,10 @@ Usage:
   code-router serve start [router flags]
   code-router serve stop [--port PORT]
   code-router serve apis [--provider openai|claude|openrouter|all]
-  code-router verify [--provider claude|openai|all] [--json]
-  code-router models [--provider claude|openai|openrouter|all] [--json]
-  code-router auth <claude|openai|status>
-  code-router logout <claude|openai|all>
+  code-router verify [--provider claude|openai|copilot|all] [--json]
+  code-router models [--provider claude|openai|copilot|openrouter|all] [--json]
+  code-router auth <claude|openai|copilot|status>
+  code-router logout <claude|openai|copilot|all>
   code-router status [--json]
 
 Flags:
@@ -534,11 +536,17 @@ async function main(): Promise<void> {
         console.log('ChatGPT authentication saved.');
         return;
       }
+      if (target === 'copilot' || target === 'github-copilot') {
+        const enterpriseUrl = getOption(parsed.commandArgs, 'enterprise-url');
+        await runCopilotOAuth(enterpriseUrl);
+        console.log('Copilot authentication saved.');
+        return;
+      }
       throw new Error(`Unsupported auth target: ${target}`);
     }
     case 'logout': {
-      const target = (parsed.commandArgs[0] || 'all') as 'claude' | 'openai' | 'all';
-      if (target !== 'claude' && target !== 'openai' && target !== 'all') {
+      const target = (parsed.commandArgs[0] || 'all') as 'claude' | 'openai' | 'copilot' | 'all';
+      if (target !== 'claude' && target !== 'openai' && target !== 'copilot' && target !== 'all') {
         throw new Error(`Unsupported logout target: ${target}`);
       }
       await logout(target);
